@@ -322,7 +322,6 @@ SR_DRIVER([BK Precision 1856D], [bkprecision-1856d], [serial_comm])
 SR_DRIVER([CEM DT-885x], [cem-dt-885x], [serial_comm])
 SR_DRIVER([Center 3xx], [center-3xx], [serial_comm])
 SR_DRIVER([ChronoVu LA], [chronovu-la], [libusb libftdi])
-SR_DRIVER([ZLG LA], [zlg-la], [libusb libftdi])
 SR_DRIVER([Colead SLM], [colead-slm], [serial_comm])
 SR_DRIVER([Conrad DIGI 35 CPU], [conrad-digi-35-cpu], [serial_comm])
 SR_DRIVER([dcttech usbrelay], [dcttech-usbrelay], [libhidapi])
@@ -397,6 +396,7 @@ SR_DRIVER([UNI-T UT32x], [uni-t-ut32x], [serial_comm])
 SR_DRIVER([Yokogawa DL/DLM], [yokogawa-dlm])
 SR_DRIVER([ZEROPLUS Logic Cube], [zeroplus-logic-cube], [libusb])
 SR_DRIVER([ZKETECH EBD-USB], [zketech-ebd-usb], [serial_comm])
+SR_DRIVER([ZLG LA], [zlg-la], [libusb])
 
 ###############################
 ##  Language bindings setup  ##

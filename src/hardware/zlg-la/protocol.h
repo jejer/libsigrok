@@ -1,128 +1,47 @@
-/*
- * This file is part of the libsigrok project.
- *
- * Copyright (C) 2011-2014 Uwe Hermann <uwe@hermann-uwe.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
- */
-
 #ifndef LIBSIGROK_HARDWARE_ZLG_LA_PROTOCOL_H
 #define LIBSIGROK_HARDWARE_ZLG_LA_PROTOCOL_H
 
+#include <config.h>
+#include <stdint.h>
 #include <glib.h>
 #include <libusb.h>
-#include <ftdi.h>
-#include <stdint.h>
-#include <string.h>
 #include <libsigrok/libsigrok.h>
 #include "libsigrok-internal.h"
 
+#include "protocol.h"
+
 #define LOG_PREFIX "zlg-la"
 
-#define SDRAM_SIZE			(8 * 1024 * 1024)
-#define MAX_NUM_SAMPLES			SDRAM_SIZE
+#define ZLG_VID 0x04cc
+#define ZLG_PID 0x120e
 
-#define BS				4096 /* Block size */
-#define NUM_BLOCKS			2048 /* Number of blocks */
-
-enum {
-	ZLG_LA8,
-	ZLG_LA16,
-};
-
-struct zlg_profile {
-	int model;
-	const char *modelname;
-	const char *iproduct;
-	unsigned int num_channels;
-	uint64_t max_samplerate;
-	const int num_trigger_matches;
-	float trigger_constant;
-};
+#define CMD_FW_UPLOAD  0x01 /* FE01: Firmware/FPGA bitstream start */
+#define CMD_GET_STATUS 0x02 /* FD02: Periodic status (every 3ms) */
+#define CMD_COMMIT     0x03 /* FC03: Settings commit/ping */
+#define CMD_SET_FREQ   0x05 /* FA05: Sample rate / divider */
+#define CMD_TELEMETRY  0x06 /* F906: Battery, power, and signal flags */
+#define CMD_SET_TRIG   0x07 /* F807: Trigger pattern/mask upload */
+#define CMD_QUERY_BUF  0x0c /* F30C: Activity check (Live LEDs) */
+#define CMD_START_CAP  0x0d /* F20D: Start logic acquisition */
 
 struct dev_context {
-	const struct zlg_profile *prof;
-	struct ftdi_context *ftdic;
+	struct sr_sw_limits limits;
 	uint64_t cur_samplerate;
-	uint64_t limit_msec;
-	uint64_t limit_samples;
+	gboolean poll_running;
+	GMutex usb_mutex;
 
-	/**
-	 * A buffer containing some (mangled) samples from the device.
-	 * Format: Pretty mangled-up (due to hardware reasons), see code.
-	 */
-	uint8_t mangled_buf[BS];
+	uint16_t trigger_mask;    /* Which channels are involved in the trigger */
+    uint16_t trigger_value;   /* High or Low level */
+    uint16_t trigger_edge;    /* Rising or Falling */
 
-	/**
-	 * An 8MB buffer where we'll store the de-mangled samples.
-	 * LA8: Each sample is 1 byte, MSB is channel 7, LSB is channel 0.
-	 * LA16: Each sample is 2 bytes, MSB is channel 15, LSB is channel 0.
-	 */
-	uint8_t *final_buf;
-
-	/**
-	 * Trigger pattern.
-	 * A 1 bit matches a high signal, 0 matches a low signal on a channel.
-	 *
-	 * If the resp. 'trigger_edgemask' bit is set, 1 means "rising edge",
-	 * and 0 means "falling edge".
-	 */
-	uint16_t trigger_pattern;
-
-	/**
-	 * Trigger mask.
-	 * A 1 bit means "must match trigger_pattern", 0 means "don't care".
-	 */
-	uint16_t trigger_mask;
-
-	/**
-	 * Trigger edge mask.
-	 * A 1 bit means "edge triggered", 0 means "state triggered".
-	 *
-	 * Edge triggering is only supported on LA16 (but not LA8).
-	 */
-	uint16_t trigger_edgemask;
-
-	/** Tells us whether an SR_DF_TRIGGER packet was already sent. */
-	int trigger_found;
-
-	/** Used for keeping track how much time has passed. */
-	gint64 done;
-
-	/** Counter/index for the data block to be read. */
-	int block_counter;
-
-	/** The divcount value (determines the sample period). */
-	uint8_t divcount;
-
-	/** This ChronoVu device's USB VID/PID. */
-	uint16_t usb_vid;
-	uint16_t usb_pid;
-
-	/** Samplerates supported by this device. */
-	uint64_t samplerates[255];
+	uint32_t expected_bytes;
 };
 
-extern SR_PRIV const char *zlg_channel_names[];
-extern const struct zlg_profile zlg_profiles[];
-SR_PRIV void zlg_fill_samplerates_if_needed(const struct sr_dev_inst *sdi);
-SR_PRIV uint8_t zlg_samplerate_to_divcount(const struct sr_dev_inst *sdi,
-					  uint64_t samplerate);
-SR_PRIV int zlg_write(struct dev_context *devc, uint8_t *buf, int size);
-SR_PRIV int zlg_convert_trigger(const struct sr_dev_inst *sdi);
-SR_PRIV int zlg_set_samplerate(const struct sr_dev_inst *sdi, uint64_t samplerate);
-SR_PRIV int zlg_read_block(struct dev_context *devc);
-SR_PRIV void zlg_send_block_to_session_bus(const struct sr_dev_inst *sdi, int block);
+SR_PRIV int zlg_la_transmit(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8_t *payload, size_t len);
+SR_PRIV int zlg_la_poll_activity(const struct sr_dev_inst *sdi);
+SR_PRIV int zlg_la_setup_acquisition(const struct sr_dev_inst *sdi);
+SR_PRIV int zlg_la_receive_data(int fd, int revents, void *cb_data);
+SR_PRIV int zlg_la_set_samplerate(const struct sr_dev_inst *sdi, uint64_t samplerate);
+SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi);
 
 #endif
