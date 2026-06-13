@@ -24,27 +24,28 @@
 #define CMD_QUERY_BUF  0x0c /* F30C: Activity check (Live LEDs) */
 #define CMD_START_CAP  0x0d /* F20D: Start logic acquisition */
 
-#define ZLG_FW_NAME "zlg-la1016.bitstream"
+#define STATE_IDLE    0x00
+#define STATE_CAPTURE 0x01
+#define STATE_WAITING 0x02
+#define STATE_DESTROY 0x03
+
+#define ZLG_FW_NAME "Configure1016.dll"
 
 struct dev_context {
 	struct sr_sw_limits limits;
 	uint64_t cur_samplerate;
-	gboolean poll_running;
+	uint16_t state;	// idle, capture, waiting ...
+	guint timer_id; // for the work loop
 	GMutex usb_mutex;
 
 	uint16_t trigger_mask;    /* Which channels are involved in the trigger */
     uint16_t trigger_value;   /* High or Low level */
     uint16_t trigger_edge;    /* Rising or Falling */
-
-	uint32_t expected_bytes;
 };
 
 SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name);
-SR_PRIV int zlg_la_transmit(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8_t *payload, size_t len);
-SR_PRIV int zlg_la_poll_activity(const struct sr_dev_inst *sdi);
-SR_PRIV int zlg_la_setup_acquisition(const struct sr_dev_inst *sdi);
-SR_PRIV int zlg_la_receive_data(int fd, int revents, void *cb_data);
 SR_PRIV int zlg_la_set_samplerate(const struct sr_dev_inst *sdi, uint64_t samplerate);
 SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi);
+SR_PRIV gboolean zlg_la_work_loop(gpointer user_data);
 
 #endif

@@ -133,6 +133,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 	struct sr_dev_driver *di = sdi->driver;
 	struct drv_context *drvc = di->context;
 	struct sr_usb_dev_inst *usb = sdi->conn;
+	struct dev_context *devc = sdi->priv;
 	int ret;
 
 	/* 
@@ -149,18 +150,27 @@ static int dev_open(struct sr_dev_inst *sdi)
 	 * For now, we upload every time for testing.
 	 */
 	ret = zlg_la_fw_upload(sdi, ZLG_FW_NAME);
+	if (ret != SR_OK)
+		return ret;
 
-	return ret;
+	devc->state = STATE_IDLE;
+	devc->timer_id = g_timeout_add(100, zlg_la_work_loop, (void *)sdi);
+
+	return SR_OK;
 }
 
 static int dev_close(struct sr_dev_inst *sdi)
 {
 	struct sr_usb_dev_inst *usb = sdi->conn;
+	struct dev_context *devc = sdi->priv;
 
 	if (!usb->devhdl)
 		return SR_OK;
 
 	sr_info("Closing device on %d.%d interface 0", usb->bus, usb->address);
+	devc->state = STATE_DESTROY;
+	g_source_remove(devc->timer_id);
+
 	
 	/* Close the libusb handle directly */
 	libusb_release_interface(usb->devhdl, 0);
@@ -176,16 +186,16 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	std_session_send_df_header(sdi);
 
-	sr_session_source_add(sdi->session, -1, 0, 10, zlg_la_receive_data, (void *)sdi);
-	
-	devc->poll_running = TRUE;
+	devc->state = STATE_CAPTURE;
 
-	return zlg_la_setup_acquisition(sdi);
+	return SR_OK;
 }
 
 static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 {
-	return std_session_send_df_end(sdi);
+	struct dev_context *devc = sdi->priv;
+	devc->state = STATE_IDLE;
+	return SR_OK;
 }
 
 static struct sr_dev_driver zlg_la_driver_info = {
