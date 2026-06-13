@@ -143,7 +143,14 @@ static int dev_open(struct sr_dev_inst *sdi)
 	if (ret != SR_OK)
 		return ret;
 
-	return SR_OK;
+	/*
+	 * TODO: Check if FW is already loaded.
+	 * We can send 0xFD02 and check the response.
+	 * For now, we upload every time for testing.
+	 */
+	ret = zlg_la_fw_upload(sdi, ZLG_FW_NAME);
+
+	return ret;
 }
 
 static int dev_close(struct sr_dev_inst *sdi)

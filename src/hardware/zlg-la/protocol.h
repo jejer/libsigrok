@@ -24,6 +24,8 @@
 #define CMD_QUERY_BUF  0x0c /* F30C: Activity check (Live LEDs) */
 #define CMD_START_CAP  0x0d /* F20D: Start logic acquisition */
 
+#define ZLG_FW_NAME "zlg-la1016.bitstream"
+
 struct dev_context {
 	struct sr_sw_limits limits;
 	uint64_t cur_samplerate;
@@ -37,6 +39,7 @@ struct dev_context {
 	uint32_t expected_bytes;
 };
 
+SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name);
 SR_PRIV int zlg_la_transmit(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8_t *payload, size_t len);
 SR_PRIV int zlg_la_poll_activity(const struct sr_dev_inst *sdi);
 SR_PRIV int zlg_la_setup_acquisition(const struct sr_dev_inst *sdi);

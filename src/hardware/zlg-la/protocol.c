@@ -1,6 +1,8 @@
 #include <config.h>
 #include "protocol.h"
 
+#include <fcntl.h>
+
 /* Replicates sub_10001130: Packs the 16-byte command wrapper */
 SR_PRIV int zlg_la_transmit(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8_t *payload, size_t len)
 {
@@ -23,15 +25,15 @@ SR_PRIV int zlg_la_transmit(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8
 	return SR_OK;
 }
 
-/* Helper to read the 16-byte response from EP 0x81 */
+/* Helper to read the response from EP 0x81, size not fixed */
 static int zlg_la_read_response(const struct sr_dev_inst *sdi, uint8_t *rsp)
 {
 	struct sr_usb_dev_inst *usb = sdi->conn;
 	int transferred, ret;
 
 	ret = libusb_bulk_transfer(usb->devhdl, 0x81, rsp, 16, &transferred, 100);
-	if (ret < 0 || transferred != 16) {
-		sr_err("Response read failed: %s", libusb_error_name(ret));
+	if (ret < 0 || transferred == 0) {
+		sr_err("Response read failed: %s, transfered:%d", libusb_error_name(ret), transferred);
 		return SR_ERR;
 	}
 	return SR_OK;
@@ -219,4 +221,65 @@ SR_PRIV int zlg_la_receive_data(int fd, int revents, void *cb_data)
 	sr_dev_acquisition_stop(sdi);
 
 	return TRUE;
+}
+
+SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name)
+{
+	struct drv_context *drvc = sdi->driver->context;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	struct sr_resource bitstream;
+	uint8_t payload[4];
+	uint8_t buffer[512];
+	int transferred, ret;
+	size_t size, offset;
+
+	sr_info("Uploading firmware '%s'...", name);
+
+	/* 1. Open the firmware file using sigrok's resource loader */
+	ret = sr_resource_open(drvc->sr_ctx, &bitstream, SR_RESOURCE_FIRMWARE, name);
+	if (ret != SR_OK) {
+		sr_err("Could not find firmware %s. Place it in ~/.local/share/sigrok-firmware/", name);
+		return SR_ERR;
+	}
+
+	size = bitstream.size;
+
+	/* 2. Send CMD_FW_UPLOAD (0x01 / FE01) with the size as payload */
+	/* Payload is 4 bytes, Little Endian */
+	WL32(payload, size);
+	if (zlg_la_transmit(sdi, CMD_FW_UPLOAD, payload, 4) != SR_OK) {
+		sr_resource_close(drvc->sr_ctx, &bitstream);
+		return SR_ERR;
+	}
+
+	/* 3. Read 16-byte acknowledgement (matches sub_100023F0 check for 65025) */
+	uint8_t rsp[16];
+	zlg_la_read_response(sdi, rsp);
+	if (RL16(rsp) != 0xFE01) {
+		sr_err("Hardware rejected firmware upload command, 0x%x 0x%x", rsp[0], rsp[1]);
+		sr_resource_close(drvc->sr_ctx, &bitstream);
+		return SR_ERR;
+	}
+
+	/* 4. Stream the data in 512-byte blocks to Endpoint 0x02 */
+	offset = 0;
+	while (offset < size) {
+		size_t chunk_size = MIN(size - offset, 512);
+		sr_resource_read(drvc->sr_ctx, &bitstream, buffer, chunk_size);
+
+		ret = libusb_bulk_transfer(usb->devhdl, 0x02, buffer, chunk_size, &transferred, 1000);
+		if (ret < 0) {
+			sr_err("Firmware transfer failed at offset %zu: %s", offset, libusb_error_name(ret));
+			break;
+		}
+		offset += transferred;
+		sr_spew("Uploaded %zu/%zu bytes", offset, size);
+	}
+
+	sr_resource_close(drvc->sr_ctx, &bitstream);
+
+	if (offset < size) return SR_ERR;
+
+	sr_info("Firmware upload complete.");
+	return SR_OK;
 }
