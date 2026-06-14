@@ -46,8 +46,6 @@ struct dev_context {
 };
 
 SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name);
-SR_PRIV int zlg_la_set_samplerate(const struct sr_dev_inst *sdi, uint64_t samplerate);
-SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi);
 SR_PRIV gboolean zlg_la_work_loop(gpointer user_data);
 
 #endif
