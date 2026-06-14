@@ -72,10 +72,8 @@ SR_PRIV int zlg_la_set_samplerate(const struct sr_dev_inst *sdi, uint64_t sample
 	payload[1] = 0x83;
 	payload[2] = 0x04;
 	payload[3] = 0x09;
-	payload[8] = divider & 0xFF;
-	payload[9] = (divider >> 8) & 0xFF;
-	payload[10] = (divider >> 16) & 0xFF;
-	payload[11] = (divider >> 24) & 0xFF;
+	payload[10] = 0xcc;
+	payload[11] = 0x0c;
 
 	sr_info("Setting samplerate to %" PRIu64 " Hz (Divider: %u)", samplerate, divider);
 	
@@ -94,7 +92,7 @@ SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	uint8_t payload[14] = {0};
-	uint8_t pattern[32] = {0};
+	uint8_t pattern[96] = {0};	// 64 for one shot; 96 for pin trigger;
 	int transferred;
 
 	sr_dbg("Configuring trigger...");
@@ -107,22 +105,27 @@ SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi)
 	pattern[0] = 0x01;
 	pattern[1] = 0x01;
 	pattern[2] = 0x10;
-	pattern[3] = 0x1a; 
+	pattern[3] = 0x10;
+	pattern[17] = 0x18;
+	pattern[32] = 0x01;
+	pattern[33] = 0x01;
+	pattern[34] = 0x10;
+	pattern[35] = 0x10;
+	pattern[49] = 0x10;
 	/* ... fill remaining based on your pcap BULK_OUT 01011010... */
 
 	/* 1. Tell device to expect 32 bytes of trigger data */
 	payload[0] = 0x02;
 	payload[1] = 0x00;
 	payload[2] = 0x06;
-	payload[3] = 0x40;
-	payload[10] = 32; /* Length of the following bulk out */
+	payload[3] = 0x20;	// 0x40->one shot; 0x66 trigger
 	
 	if (zlg_la_cmd(sdi, CMD_SET_TRIG, payload, 14, NULL, NULL) != SR_OK)
 		return SR_ERR;
 
 	/* 2. Send the 32-byte pattern over Pipe 2 (Endpoint 0x02 OUT) */
 	struct sr_usb_dev_inst *usb = sdi->conn;
-	libusb_bulk_transfer(usb->devhdl, 0x02, pattern, 32, &transferred, 100);
+	libusb_bulk_transfer(usb->devhdl, 0x02, pattern, 64, &transferred, 100);
 
 	return SR_OK;
 }
@@ -161,7 +164,7 @@ static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 	if (ret != SR_OK) {
 		return ret;
 	}
-	if (rsp[0] != 0x03 || rsp[1] == 0xfc) {
+	if (rsp[0] != 0x03 || rsp[1] != 0xfc) {
 		sr_err("commit failed");
 		return SR_ERR;
 	}
@@ -191,7 +194,7 @@ static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 }
 
 /* Process the raw 98312 bytes logic data */
-SR_PRIV int zlg_la_receive_data(const struct sr_dev_inst *sdi)
+static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	struct sr_usb_dev_inst *usb = sdi->conn;
@@ -213,7 +216,7 @@ SR_PRIV int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 
 	// get data size 0df2 0609010101
 	payload[0] = 0x06; payload[1] = 0x09; payload[2] = 0x01; payload[3] = 0x01; payload[4] = 0x01;
-	ret = zlg_la_cmd(sdi, CMD_SET_FREQ, payload, 5, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_START_CAP, payload, 5, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return ret;
 	}
@@ -224,8 +227,10 @@ SR_PRIV int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	in_buffer = g_malloc(data_len);
 	
 	/* Blocking read for now (TODO: Change to async later) */
-	ret = libusb_bulk_transfer(usb->devhdl, 0x82, in_buffer, 
-				data_len, &transferred, 5000);
+	ret = libusb_bulk_transfer(usb->devhdl, 0x82, in_buffer, data_len, &transferred, 2000);
+	if (ret < 0) {
+		sr_err("Receive failed: %s, transferred: %d", libusb_error_name(ret), transferred);
+	}
 
 	// cleanup
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x00; payload[3] = 0x01;
@@ -243,7 +248,8 @@ SR_PRIV int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 		return ret;
 	}
 
-	if (ret == 0 && transferred > 0) {
+	sr_dbg("Received %u bytes of data", transferred);
+	if (transferred > 0) {
 		packet.type = SR_DF_LOGIC;
 		packet.payload = &logic;
 		logic.length = transferred;
@@ -255,6 +261,8 @@ SR_PRIV int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	g_free(in_buffer);
 	
 	std_session_send_df_end(sdi);
+
+	sr_session_source_remove(sdi->session, -1);
 
 	return TRUE;
 }
@@ -287,7 +295,7 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 	if (ret != SR_OK) {
 		return G_SOURCE_CONTINUE;
 	}
-	telemetry = rsp[2];
+	telemetry = rsp[0];
 	ret = zlg_la_cmd(sdi, CMD_QUERY_BUF, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return G_SOURCE_CONTINUE;
@@ -295,7 +303,7 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 	if (rsp[2] != 0) {
 		// drain the data
 		ret = libusb_bulk_transfer(usb->devhdl, 0x82, sink_buffer, 0xff, &rsp_len, 100);
-		sr_spew("cmd 0cf3 len:%x data: %x%x%x%x", rsp[3], sink_buffer[0],sink_buffer[1],sink_buffer[2],sink_buffer[3]);
+		sr_spew("cmd 0cf3 len:%x data: %02x%02x%02x%02x", rsp[2], sink_buffer[0],sink_buffer[1],sink_buffer[2],sink_buffer[3]);
 		if (ret != SR_OK) {
 			return G_SOURCE_CONTINUE;
 		}
@@ -304,7 +312,7 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 	if (devc->state == STATE_WAITING && telemetry == 0x28) {
 		// trigger armed
 		ret = zlg_la_receive_data(sdi);
-		devc->state == STATE_IDLE;
+		devc->state = STATE_IDLE;
 		return G_SOURCE_CONTINUE;
 	}
 
@@ -375,7 +383,11 @@ SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name)
 	offset = 0;
 	while (offset < size) {
 		size_t chunk_size = MIN(size - offset, 512);
-		sr_resource_read(drvc->sr_ctx, &bitstream, buffer, chunk_size);
+		ret = sr_resource_read(drvc->sr_ctx, &bitstream, buffer, chunk_size);
+		if (ret != SR_OK) {
+			sr_err("sr_resource_read failed %d", ret);
+			break;
+		}
 
 		ret = libusb_bulk_transfer(usb->devhdl, 0x02, buffer, chunk_size, &transferred, 1000);
 		if (ret < 0) {

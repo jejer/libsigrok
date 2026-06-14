@@ -2,22 +2,45 @@
 #include <libusb.h>
 #include "protocol.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#define sleep(x) Sleep((x) * 1000)
+#else
+#include <unistd.h>
+#endif
+
+/* Standard step samplerates between 1 MHz and 100 MHz */
+static const uint64_t samplerates[] = {
+    SR_MHZ(1),
+    SR_MHZ(2),
+    SR_MHZ(5),
+    SR_MHZ(10),
+    SR_MHZ(20),
+    SR_MHZ(25),
+    SR_MHZ(50),
+    SR_MHZ(100),
+};
+
 static const uint32_t scanopts[] = {
-	SR_CONF_CONN,
+    SR_CONF_CONN,
 };
 
 static const uint32_t drvopts[] = {
-	SR_CONF_LOGIC_ANALYZER,
+    SR_CONF_LOGIC_ANALYZER,
 };
 
 static const uint32_t devopts[] = {
-	SR_CONF_CONN,
-	SR_CONF_SAMPLERATE,
-	SR_CONF_LIMIT_SAMPLES,
+    SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+    SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+    SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
 };
 
-static const uint64_t samplerates[] = {
-	SR_HZ(1), SR_MHZ(100), SR_HZ(1),
+static const int32_t trigger_matches[] = {
+    SR_TRIGGER_ZERO,
+    SR_TRIGGER_ONE,
+    SR_TRIGGER_RISING,
+    SR_TRIGGER_FALLING,
+    SR_TRIGGER_EDGE,
 };
 
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
@@ -60,7 +83,8 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		sdi->priv = devc;
 		
 		g_mutex_init(&devc->usb_mutex);
-		devc->cur_samplerate = SR_MHZ(1);
+		devc->cur_samplerate = SR_MHZ(100);
+		sr_sw_limits_init(&devc->limits);
 
 		for (int j = 0; j < 16; j++)
 			sr_channel_new(sdi, j, SR_CHANNEL_LOGIC, TRUE, g_strdup_printf("CH%d", j));
@@ -75,57 +99,86 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 static int config_get(uint32_t key, GVariant **data, 
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
-	struct dev_context *devc;
-	(void)cg;
+    struct dev_context *devc;
 
-	if (!sdi) return SR_ERR_ARG;
-	devc = sdi->priv;
+    (void)cg;
 
-	switch (key) {
-	case SR_CONF_SAMPLERATE:
-		*data = g_variant_new_uint64(devc->cur_samplerate);
-		break;
-	default: return SR_ERR_NA;
-	}
-	return SR_OK;
+    if (!sdi)
+        return SR_ERR_ARG;
+
+    devc = sdi->priv;
+
+    switch (key) {
+    case SR_CONF_SAMPLERATE:
+        *data = g_variant_new_uint64(devc->cur_samplerate);
+        break;
+    case SR_CONF_LIMIT_SAMPLES:
+        *data = g_variant_new_uint64(devc->limit_samples);
+        break;
+    default:
+        return SR_ERR_NA;
+    }
+
+    return SR_OK;
 }
 
 static int config_set(uint32_t key, GVariant *data, 
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
-	struct dev_context *devc;
-	(void)cg;
+    struct dev_context *devc;
+    uint64_t val;
+    int idx;
 
-	if (!sdi) return SR_ERR_ARG;
-	devc = sdi->priv;
+    (void)cg;
 
-	switch (key) {
-	case SR_CONF_SAMPLERATE:
-		devc->cur_samplerate = g_variant_get_uint64(data);
-		return zlg_la_set_samplerate(sdi, devc->cur_samplerate);
-	case SR_CONF_LIMIT_SAMPLES:
-		return sr_sw_limits_config_set(&devc->limits, key, data);
-	default: return SR_ERR_NA;
-	}
-	return SR_OK;
+    if (!sdi)
+        return SR_ERR_ARG;
+
+    devc = sdi->priv;
+
+    switch (key) {
+    case SR_CONF_SAMPLERATE:
+        /* Find matching standard samplerate from the array */
+        if ((idx = std_u64_idx(data, ARRAY_AND_SIZE(samplerates))) < 0)
+            return SR_ERR_ARG;
+        devc->cur_samplerate = samplerates[idx];
+        break;
+    case SR_CONF_LIMIT_SAMPLES:
+        val = g_variant_get_uint64(data);
+        /* Emulate the limit by capping it at the maximum hardware buffer size */
+        devc->limit_samples = MIN(val, ZLG_LA1016_DEPTH);
+        break;
+    default:
+        return SR_ERR_NA;
+    }
+
+    return SR_OK;
 }
 
 static int config_list(uint32_t key, GVariant **data, 
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
-	switch (key) {
-	case SR_CONF_SCAN_OPTIONS:
-	case SR_CONF_DEVICE_OPTIONS:
-		return std_opts_config_list(key, data, sdi, cg, 
-			scanopts, G_N_ELEMENTS(scanopts),
-			drvopts, G_N_ELEMENTS(drvopts),
-			devopts, G_N_ELEMENTS(devopts));
-	case SR_CONF_SAMPLERATE:
-		*data = std_gvar_samplerates_steps(samplerates, G_N_ELEMENTS(samplerates));
-		break;
-	default: return SR_ERR_NA;
-	}
-	return SR_OK;
+    switch (key) {
+    case SR_CONF_SCAN_OPTIONS:
+    case SR_CONF_DEVICE_OPTIONS:
+        if (cg)
+            return SR_ERR_NA;
+        return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
+    case SR_CONF_SAMPLERATE:
+        *data = std_gvar_samplerates(ARRAY_AND_SIZE(samplerates));
+        break;
+    case SR_CONF_LIMIT_SAMPLES:
+        /* Return range of supported samples (from 1 to FIXED_SAMPLE_COUNT) */
+        *data = std_gvar_tuple_u64(1, ZLG_LA1016_DEPTH);
+        break;
+    case SR_CONF_TRIGGER_MATCH:
+        *data = std_gvar_array_i32(ARRAY_AND_SIZE(trigger_matches));
+        break;
+    default:
+        return SR_ERR_NA;
+    }
+
+    return SR_OK;
 }
 
 static int dev_open(struct sr_dev_inst *sdi)
@@ -180,6 +233,11 @@ static int dev_close(struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
+static int fake_receive_data(int fd, int revents, void *cb_data) {
+	// job is done in zlg_la_work_loop()
+	sleep(1);
+	return TRUE;
+}
 static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
@@ -187,6 +245,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	std_session_send_df_header(sdi);
 
 	devc->state = STATE_CAPTURE;
+	sr_session_source_add(sdi->session, -1, 0, 1000, fake_receive_data, (void *)sdi);
 
 	return SR_OK;
 }

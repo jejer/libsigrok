@@ -30,6 +30,7 @@
 #define STATE_DESTROY 0x03
 
 #define ZLG_FW_NAME "Configure1016.dll"
+#define ZLG_LA1016_DEPTH 32 * 1024 // fixed samples, 32K per channel, 16 channels 512K data
 
 struct dev_context {
 	struct sr_sw_limits limits;
@@ -37,6 +38,7 @@ struct dev_context {
 	uint16_t state;	// idle, capture, waiting ...
 	guint timer_id; // for the work loop
 	GMutex usb_mutex;
+	int limit_samples;
 
 	uint16_t trigger_mask;    /* Which channels are involved in the trigger */
     uint16_t trigger_value;   /* High or Low level */
