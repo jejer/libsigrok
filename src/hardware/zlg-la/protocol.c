@@ -206,6 +206,9 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	uint8_t rsp[16] = {0};
 	int rsp_len = 0;
 	uint8_t *in_buffer;
+	uint8_t *out_buffer;
+
+	int pin_data_len = 32 * 1024 * 16 / 8;
 
 	// stop capture 05fa 02800001
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x00; payload[3] = 0x01;
@@ -227,6 +230,7 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	in_buffer = g_malloc(data_len);
 	
 	/* Blocking read for now (TODO: Change to async later) */
+	// we must read all the data from device
 	ret = libusb_bulk_transfer(usb->devhdl, 0x82, in_buffer, data_len, &transferred, 2000);
 	if (ret < 0) {
 		sr_err("Receive failed: %s, transferred: %d", libusb_error_name(ret), transferred);
@@ -249,12 +253,22 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	}
 
 	sr_dbg("Received %u bytes of data", transferred);
+	// The device add a extra byte at every frame(2bytes), and extra 8bytes at the end
+	out_buffer = g_malloc(pin_data_len);
+	int out_buffer_idx = 0;
+	for (int i = 0; i < 3 * 32768; i++) {
+		if ((i + 1) % 3 == 0) {
+			continue;
+		}
+		out_buffer[out_buffer_idx] = in_buffer[i];
+		out_buffer_idx += 1;
+	}
 	if (transferred > 0) {
 		packet.type = SR_DF_LOGIC;
 		packet.payload = &logic;
-		logic.length = transferred;
+		logic.length = pin_data_len;
 		logic.unitsize = 2; /* 16 channels */
-		logic.data = in_buffer;
+		logic.data = out_buffer;
 		sr_session_send(sdi, &packet);
 	}
 
