@@ -16,7 +16,7 @@
 #define CMD_GET_DEVICE_INFO 0x02 /* FD02: Get device info */
 #define CMD_COMMIT          0x03 /* FC03: Settings commit */
 #define CMD_SET_EXEC        0x05 /* FA05: Sample rate / divider, and Strat / Stop capture */
-#define CMD_GET_STATE       0x06 /* F906: Activity check (Trigger Armed) */
+#define CMD_GET_STATE       0x06 /* F906: Activity check (Trigger Armed) BIT1:BUSY 2:MODE(Trigger1) 3:DONE*/
 #define CMD_SET_TRIG        0x07 /* F807: Trigger pattern/mask upload */
 #define CMD_GET_BULKIN      0x0c /* F30C: Activity check (Device Bulk Data, not used) */
 #define CMD_GET_SIZE        0x0d /* F20D: Get captured data size */
@@ -60,5 +60,6 @@ struct dev_context {
 
 SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name);
 SR_PRIV gboolean zlg_la_work_loop(gpointer user_data);
+SR_PRIV int test_work(int fd, int revents, void *cb_data);
 
 #endif

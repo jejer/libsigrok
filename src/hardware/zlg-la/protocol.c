@@ -93,47 +93,198 @@ static int zlg_la_set_samplerate_ratio(const struct sr_dev_inst *sdi)
  * Configures the FPGA trigger engine.
  * Replicates sub_100028E0.
  */
-SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi)
+static int zlg_la_build_and_send_stages(const struct sr_dev_inst *sdi, 
+    uint32_t m_lvl, uint32_t v_lvl, uint32_t m_edge, uint32_t v_e_start, uint32_t v_e_end, gboolean has_edge)
 {
-	struct dev_context *devc = sdi->priv;
+    uint8_t buf[96] = {0};
+    int num_stages = has_edge ? 3 : 2;
+
+    /* STAGE 1: Static levels AND the starting state of the edge */
+    buf[0] = 0x01;
+    WL32(&buf[4], m_lvl | m_edge);
+    WL32(&buf[8], v_lvl | v_e_start);
+    buf[12] = 0x03; // Match enabled
+    buf[17] = 0x18; // Pre-trigger ratio
+
+    if (has_edge) {
+        /* STAGE 2: Static levels AND the final state of the edge */
+        buf[32] = 0x02;
+        buf[32+2] = 0x01; // Transition Mode
+        WL32(&buf[32+4], m_lvl | m_edge);
+        WL32(&buf[32+8], v_lvl | v_e_end);
+        buf[32+12] = 0x03;
+        buf[32+17] = 0x18;
+
+        /* STAGE 3: Level finalized */
+        buf[64] = 0x02;
+        buf[64+2] = 0x10; // Level Mode
+        buf[64+17] = 0x18;
+    } else {
+        /* Level-only capture just needs a sustain stage */
+        buf[32] = 0x01; // Immediate/Level
+        buf[32+2] = 0x10;
+        buf[32+17] = 0x10;
+    }
+}
+
+static int zlg_la_send_trigger_blocks(const struct sr_dev_inst *sdi, uint8_t *data, int len) {
+	struct sr_usb_dev_inst *usb = sdi->conn;
 	uint8_t payload[14] = {0};
-	uint8_t pattern[96] = {0};	// 64 for one shot; 96 for pin trigger;
-	int transferred;
+	int ret, transferred;
 
 	sr_dbg("Configuring trigger...");
-
-	/* 
-	 * TODO: Use the trigger_mask/value/edge from the session to fill
-	 * the 32-byte pattern. For now, we use a simple "Always Trigger" 
-	 * or "Manual Trigger" pattern seen in your pcap.
-	 */
-	pattern[0] = 0x01;
-	pattern[1] = 0x01;
-	pattern[2] = 0x10;
-	pattern[3] = 0x10;
-	pattern[17] = 0x18;
-	pattern[32] = 0x01;
-	pattern[33] = 0x01;
-	pattern[34] = 0x10;
-	pattern[35] = 0x10;
-	pattern[49] = 0x10;
-	/* ... fill remaining based on your pcap BULK_OUT 01011010... */
 
 	/* 1. Tell device to expect 32 bytes of trigger data */
 	payload[0] = 0x02;
 	payload[1] = 0x00;
 	payload[2] = 0x06;
-	payload[3] = 0x20;	// 0x40->one shot; 0x66 trigger
+	payload[3] = len;
 	
 	if (zlg_la_cmd(sdi, CMD_SET_TRIG, payload, 14, NULL, NULL) != SR_OK)
 		return SR_ERR;
 
-	/* 2. Send the 32-byte pattern over Pipe 2 (Endpoint 0x02 OUT) */
-	struct sr_usb_dev_inst *usb = sdi->conn;
-	libusb_bulk_transfer(usb->devhdl, 0x02, pattern, 64, &transferred, 100);
-
+	GString *hex_str = sr_hexdump_new(data, len);
+	sr_dbg("trigger: %s", hex_str->str);
+	ret = libusb_bulk_transfer(usb->devhdl, 0x02, data, len, &transferred, 100);
+	if (ret < 0 || transferred != len) {
+		sr_err("send trigger failed, ret = %s, transferred = %d/%d", libusb_error_name(ret), transferred, len);
+		return SR_ERR;
+	}
 	return SR_OK;
 }
+static int zlg_la_set_trigger(const struct sr_dev_inst *sdi)
+{
+    struct sr_trigger *trigger;
+    struct sr_trigger_stage *stage;
+    struct sr_trigger_match *match;
+    GSList *l, *m;
+	uint8_t buf[96] = {0};
+
+    uint32_t mask_lvl = 0, value_lvl = 0;
+    uint32_t mask_edge = 0, value_edge_start = 0, value_edge_end = 0;
+    gboolean has_edge = FALSE;
+	
+    if (!(trigger = sr_session_trigger_get(sdi->session))) {
+        /* --- CASE 1: IMMEDIATE TRIGGER (Baseline Dump) --- */
+        /* Block 1 */
+        buf[0] = 0x01; buf[1] = 0x01; buf[2] = 0x10; buf[3] = 0x10;
+        buf[12] = 0x00; buf[17] = 0x18;
+        /* Block 2 */
+        buf[32] = 0x01; buf[32+1] = 0x01; buf[32+2] = 0x10; buf[32+3] = 0x10;
+        buf[32+12] = 0x00; buf[32+17] = 0x10;
+        
+        return zlg_la_send_trigger_blocks(sdi, buf, 64);
+    }
+
+    /* We only support the first sigrok trigger stage */
+    stage = trigger->stages->data; 
+
+    for (m = stage->matches; m; m = m->next) {
+        match = m->data;
+        if (!match->channel->enabled) continue;
+
+        uint32_t bit = (1 << match->channel->index);
+
+        if (match->match == SR_TRIGGER_ONE) {
+            mask_lvl |= bit;
+            value_lvl |= bit;
+        } else if (match->match == SR_TRIGGER_ZERO) {
+            mask_lvl |= bit;
+        } else if (match->match == SR_TRIGGER_RISING) {
+            has_edge = TRUE;
+            mask_edge |= bit;
+            value_edge_end |= bit;   /* Ends High */
+        } else if (match->match == SR_TRIGGER_FALLING) {
+            has_edge = TRUE;
+            mask_edge |= bit;
+            value_edge_start |= bit; /* Starts High */
+        }
+    }
+
+    if (has_edge) {
+        /* --- CASE 2: EDGE TRIGGER (3 Stages) --- */
+        /* STAGE 1: Look for the "Before" condition */
+        buf[0] = 0x01;
+        buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x00; // Edge Prep mode
+        WL32(&buf[4], mask_lvl | mask_edge);
+        WL32(&buf[8], value_lvl | value_edge_start);
+        buf[12] = 0x03; buf[17] = 0x18;
+
+        /* STAGE 2: Transition Condition */
+        buf[32] = 0x02;
+        buf[32+1] = 0x01; buf[32+2] = 0x10; buf[32+3] = 0x00; // Edge Transition mode
+        WL32(&buf[32+4], mask_lvl | mask_edge);
+        WL32(&buf[32+8], value_lvl | value_edge_end);
+        buf[32+12] = 0x03; buf[32+17] = 0x18;
+
+        /* STAGE 3: Finalizer (Level Match) */
+        buf[64] = 0x02;
+        buf[64+1] = 0x02; buf[64+2] = 0x10; buf[64+3] = 0x10; // Finalize mode
+        // WL32(&buf[64+4], mask_lvl | mask_edge);
+        // WL32(&buf[64+8], value_lvl | value_edge_end);
+        buf[64+12] = 0x03; buf[64+17] = 0x18;
+
+        return zlg_la_send_trigger_blocks(sdi, buf, 96);
+
+    } else {
+        /* --- CASE 3: LEVEL/BUS TRIGGER (2 Stages) --- */
+        /* STAGE 1: Compare against pattern */
+        buf[0] = 0x01;
+        buf[1] = 0x00; buf[2] = 0x10; buf[3] = 0x00; // Level Match mode
+        WL32(&buf[4], mask_lvl);
+        WL32(&buf[8], value_lvl);
+        buf[12] = 0x03; buf[17] = 0x18;
+
+        /* STAGE 2: Terminal State */
+        buf[32] = 0x01;
+        buf[32+1] = 0x01; buf[32+2] = 0x10; buf[32+3] = 0x10; // Sustain mode
+        buf[32+12] = 0x00; buf[32+17] = 0x18;
+
+        return zlg_la_send_trigger_blocks(sdi, buf, 64);
+    }
+}
+
+// SR_PRIV int zlg_la_set_trigger(const struct sr_dev_inst *sdi)
+// {
+	// struct dev_context *devc = sdi->priv;
+	// uint8_t payload[14] = {0};
+	// uint8_t pattern[96] = {0};	// 64 for one shot; 96 for pin trigger;
+	// int transferred;
+// 
+	// sr_dbg("Configuring trigger...");
+// 
+	// /* 
+	//  * TODO: Use the trigger_mask/value/edge from the session to fill
+	//  * the 32-byte pattern. For now, we use a simple "Always Trigger" 
+	//  * or "Manual Trigger" pattern seen in your pcap.
+	//  */
+	// pattern[0] = 0x01;
+	// pattern[1] = 0x01;
+	// pattern[2] = 0x10;
+	// pattern[3] = 0x10;
+	// pattern[17] = 0x18;
+	// pattern[32] = 0x01;
+	// pattern[33] = 0x01;
+	// pattern[34] = 0x10;
+	// pattern[35] = 0x10;
+	// pattern[49] = 0x10;
+	// /* ... fill remaining based on your pcap BULK_OUT 01011010... */
+// 
+	// /* 1. Tell device to expect 32 bytes of trigger data */
+	// payload[0] = 0x02;
+	// payload[1] = 0x00;
+	// payload[2] = 0x06;
+	// payload[3] = 0x20;	// 0x40->one shot; 0x66 trigger
+	// 
+	// if (zlg_la_cmd(sdi, CMD_SET_TRIG, payload, 14, NULL, NULL) != SR_OK)
+		// return SR_ERR;
+// 
+	// /* 2. Send the 32-byte pattern over Pipe 2 (Endpoint 0x02 OUT) */
+	// struct sr_usb_dev_inst *usb = sdi->conn;
+	// libusb_bulk_transfer(usb->devhdl, 0x02, pattern, 64, &transferred, 100);
+// 
+	// return SR_OK;
+// }
 
 static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 	int ret = SR_OK;
@@ -199,7 +350,7 @@ static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 }
 
 /* Process the raw 98312 bytes logic data */
-static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
+static int zlg_la_receive_data(const struct sr_dev_inst *sdi, gboolean drain)
 {
 	struct dev_context *devc = sdi->priv;
 	struct sr_usb_dev_inst *usb = sdi->conn;
@@ -245,12 +396,12 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x00; payload[3] = 0x01;
 	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
 	if (ret != SR_OK) {
-		return TRUE;
+		return ret;
 	}
 	payload[0] = 0x02; payload[1] = 0x88; payload[2] = 0x04; payload[3] = 0x0c;
 	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
 	if (ret != SR_OK) {
-		return TRUE;
+		return ret;
 	}
 	ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
@@ -258,6 +409,10 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	}
 
 	sr_dbg("Received %u bytes of data", transferred);
+	if (drain) {
+		g_free(in_buffer);
+		return SR_OK;
+	}
 	/*
 	  la1016 data depth: 32k bits per channel, 16 channels.
       32 * 1024 / 8 32k bytes per channel  x 16 channels = 65536 bytes (0xFFFF)
@@ -294,7 +449,7 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 
 	sr_session_source_remove(sdi->session, -1);
 
-	return TRUE;
+	return SR_OK;
 }
 
 // return G_SOURCE_CONTINUE to continue the loop
@@ -307,7 +462,7 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 	int ret = SR_OK;
 	uint8_t payload[16] = {0};
 	uint8_t rsp[16] = {0};
-	uint8_t telemetry = 0;
+	uint8_t status = 0;
 	int rsp_len = 0;
 
 	if (devc->state == STATE_CAPTURE) {
@@ -319,13 +474,13 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 		return G_SOURCE_CONTINUE;
 	}
 
-	/* 1. Send F906 (Telemetry) 02800402 - check if triggered */
+	/* 1. Send F906 (status) 02800402 - check if triggered */
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x04; payload[3] = 0x02;
 	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return G_SOURCE_CONTINUE;
 	}
-	telemetry = rsp[0];
+	status = rsp[0];
 	ret = zlg_la_cmd(sdi, CMD_GET_BULKIN, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return G_SOURCE_CONTINUE;
@@ -339,19 +494,81 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 		}
 	}
 
-	if (devc->state == STATE_WAITING && telemetry == 0x28) {
+	if (devc->state == STATE_WAITING && !(status & 0x02) && (status & 0x08)  ) {
 		// trigger armed
-		ret = zlg_la_receive_data(sdi);
+		ret = zlg_la_receive_data(sdi, FALSE);
 		devc->state = STATE_IDLE;
 		return G_SOURCE_CONTINUE;
 	}
 
-	if (telemetry == 0x26 && devc->state == STATE_IDLE) {
+	if ((status & 0x02) && devc->state == STATE_IDLE) {
 		// waiting data and user request stop
-		ret = zlg_la_receive_data(sdi);
+		ret = zlg_la_receive_data(sdi, FALSE);
 	}
 
     return G_SOURCE_CONTINUE;
+}
+
+SR_PRIV int test_work(int fd, int revents, void *cb_data) {
+	const struct sr_dev_inst *sdi = cb_data;
+    struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	int ret = SR_OK;
+	uint8_t payload[16] = {0};
+	uint8_t rsp[16] = {0};
+	uint8_t status = 0;
+	int rsp_len = 0;
+
+	// check device
+	ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
+	if (ret != SR_OK || rsp[4] == 0xff || rsp[5] == 0xff) {
+		sr_err("Device fw not working");
+		return FALSE;
+	}
+
+	// check state
+	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x04; payload[3] = 0x02;
+	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
+	if (ret != SR_OK || rsp[0] == 0x2a) {
+		sr_err("Device not idle");
+		return FALSE;
+	}
+
+	// drain residual data
+	zlg_la_receive_data(sdi, TRUE);
+
+	// start
+	zlg_la_start_capture(sdi);
+
+	while(1) {
+		payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x04; payload[3] = 0x02;
+		ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
+		if (ret != SR_OK) {
+			return FALSE;
+		}
+		status = rsp[0];
+		ret = zlg_la_cmd(sdi, CMD_GET_BULKIN, NULL, 0, rsp, &rsp_len);
+		if (ret != SR_OK) {
+			return FALSE;
+		}
+		if (rsp[2] != 0) {
+			// drain the data
+			ret = libusb_bulk_transfer(usb->devhdl, 0x82, sink_buffer, 0xff, &rsp_len, 100);
+			sr_spew("cmd 0cf3 len:%x data: %02x%02x%02x%02x", rsp[2], sink_buffer[0],sink_buffer[1],sink_buffer[2],sink_buffer[3]);
+			if (ret != SR_OK) {
+				return FALSE;
+			}
+		}
+
+		if (!(status & 0x02) && (status & 0x08)) {
+			// trigger armed
+			ret = zlg_la_receive_data(sdi, FALSE);
+			devc->state = STATE_IDLE;
+			return FALSE;
+		}
+
+		g_usleep(200*1000);	//1MHz 32k samples ~ 32ms
+	}
 }
 
 SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name)

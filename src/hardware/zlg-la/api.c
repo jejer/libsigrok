@@ -41,7 +41,6 @@ static const int32_t trigger_matches[] = {
     SR_TRIGGER_ONE,
     SR_TRIGGER_RISING,
     SR_TRIGGER_FALLING,
-    SR_TRIGGER_EDGE,
 };
 
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
@@ -234,7 +233,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 		return ret;
 
 	devc->state = STATE_IDLE;
-	devc->timer_id = g_timeout_add(100, zlg_la_work_loop, (void *)sdi);
+	// devc->timer_id = g_timeout_add(1000, zlg_la_work_loop, (void *)sdi);
 
 	return SR_OK;
 }
@@ -272,7 +271,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	std_session_send_df_header(sdi);
 
 	devc->state = STATE_CAPTURE;
-	sr_session_source_add(sdi->session, -1, 0, 1000, fake_receive_data, (void *)sdi);
+	sr_session_source_add(sdi->session, -1, 0, 1000, test_work, (void *)sdi);
 
 	return SR_OK;
 }
