@@ -81,7 +81,7 @@ static int zlg_la_set_samplerate(const struct sr_dev_inst *sdi)
 
 	sr_info("Setting samplerate to %" PRIu64 " Hz (Divider: %u)", devc->cur_samplerate, divider);
 	
-	if (zlg_la_cmd(sdi, CMD_SET_FREQ, payload, 14, NULL, NULL) != SR_OK) {
+	if (zlg_la_cmd(sdi, CMD_SET_EXEC, payload, 14, NULL, NULL) != SR_OK) {
 		return SR_ERR;
 	}
 
@@ -147,7 +147,7 @@ static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 	}
 
 	// check device state
-	ret = zlg_la_cmd(sdi, CMD_GET_STATUS, NULL, 0, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return ret;
 	}
@@ -188,7 +188,7 @@ static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 			payload[5] = 0x02;
 			break;
 		}
-		ret = zlg_la_cmd(sdi, CMD_SET_FREQ, payload, 6, NULL, NULL);
+		ret = zlg_la_cmd(sdi, CMD_SET_EXEC, payload, 6, NULL, NULL);
 		if (ret != SR_OK) {
 			return ret;
 		}
@@ -216,14 +216,14 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 
 	// stop capture 05fa 02800001
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x00; payload[3] = 0x01;
-	ret = zlg_la_cmd(sdi, CMD_SET_FREQ, payload, 4, NULL, NULL);
+	ret = zlg_la_cmd(sdi, CMD_SET_EXEC, payload, 4, NULL, NULL);
 	if (ret != SR_OK) {
 		return ret;
 	}
 
 	// get data size 0df2 0609010101
 	payload[0] = 0x06; payload[1] = 0x09; payload[2] = 0x01; payload[3] = 0x01; payload[4] = 0x01;
-	ret = zlg_la_cmd(sdi, CMD_START_CAP, payload, 5, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_SIZE, payload, 5, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return ret;
 	}
@@ -242,16 +242,16 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 
 	// cleanup
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x00; payload[3] = 0x01;
-	ret = zlg_la_cmd(sdi, CMD_TELEMETRY, payload, 4, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return TRUE;
 	}
 	payload[0] = 0x02; payload[1] = 0x88; payload[2] = 0x04; payload[3] = 0x0c;
-	ret = zlg_la_cmd(sdi, CMD_TELEMETRY, payload, 4, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return TRUE;
 	}
-	ret = zlg_la_cmd(sdi, CMD_GET_STATUS, NULL, 0, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return ret;
 	}
@@ -267,17 +267,20 @@ static int zlg_la_receive_data(const struct sr_dev_inst *sdi)
 	// remote the extra byte
 	out_buffer = g_malloc(pin_data_len);
 	int out_buffer_idx = 0;
-	for (int i = 0; i < 3 * 32768; i++) {
+	for (int i = 0; i < 3 * devc->product->max_sample_depth * 1024; i++) {
 		if ((i + 1) % 3 == 0) {
 			continue;
 		}
 		out_buffer[out_buffer_idx] = in_buffer[i];
 		out_buffer_idx += 1;
+		if (out_buffer_idx > (devc->limit_samples * 2)) {
+			break;
+		}
 	}
 	if (transferred > 0) {
 		packet.type = SR_DF_LOGIC;
 		packet.payload = &logic;
-		logic.length = pin_data_len;
+		logic.length = devc->limit_samples * 2;
 		logic.unitsize = 2; /* 16 channels */
 		logic.data = out_buffer;
 		sr_session_send(sdi, &packet);
@@ -317,12 +320,12 @@ SR_PRIV gboolean zlg_la_work_loop(gpointer user_data) {
 
 	/* 1. Send F906 (Telemetry) 02800402 - check if triggered */
 	payload[0] = 0x02; payload[1] = 0x80; payload[2] = 0x04; payload[3] = 0x02;
-	ret = zlg_la_cmd(sdi, CMD_TELEMETRY, payload, 4, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return G_SOURCE_CONTINUE;
 	}
 	telemetry = rsp[0];
-	ret = zlg_la_cmd(sdi, CMD_QUERY_BUF, NULL, 0, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_BULKIN, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return G_SOURCE_CONTINUE;
 	}
@@ -363,7 +366,7 @@ SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name)
 	size_t size, offset;
 
 	// check device state
-	ret = zlg_la_cmd(sdi, CMD_GET_STATUS, NULL, 0, rsp, &rsp_len);
+	ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
 	if (ret != SR_OK) {
 		return ret;
 	}

@@ -30,9 +30,10 @@ static const uint32_t drvopts[] = {
 };
 
 static const uint32_t devopts[] = {
-    SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+    SR_CONF_SAMPLERATE    | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
     SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
     SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
+	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
 };
 
 static const int32_t trigger_matches[] = {
@@ -52,7 +53,9 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	struct dev_context *devc;
 	libusb_device **devlist;
 	struct libusb_device_descriptor desc;
-	int i, ret;
+	struct zlg_product *product = NULL;
+	struct zlg_product *check = NULL;
+	int i, j, ret;
 
 	(void)options;
 
@@ -64,15 +67,24 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		if (ret != 0)
 			continue;
 
-		/* Check if VID and PID match 04cc:120e */
-		if (desc.idVendor != ZLG_VID || desc.idProduct != ZLG_PID)
+		product = NULL;
+		for (j = 0; zlg_products[j].vid; j++) {
+			check = &zlg_products[j];
+			if (desc.idVendor != check->vid)
+				continue;
+			if (desc.idProduct != check->pid)
+				continue;
+			product = check;
+			break;
+		}
+		if (!product)
 			continue;
 
 		sdi = g_malloc0(sizeof(struct sr_dev_inst));
 		sdi->driver = di;
 		sdi->status = SR_ST_INACTIVE;
 		sdi->vendor = g_strdup("ZLG");
-		sdi->model = g_strdup("LA1016");
+		sdi->model = g_strdup(product->product_name);
 		sdi->inst_type = SR_INST_USB;
 		
 		/* Initialize the USB connection instance with Bus and Address */
@@ -81,10 +93,12 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 
 		devc = g_malloc0(sizeof(struct dev_context));
 		sdi->priv = devc;
+		devc->product = product;
 		
 		g_mutex_init(&devc->usb_mutex);
-		devc->cur_samplerate = SR_MHZ(100);
-		sr_sw_limits_init(&devc->limits);
+		devc->cur_samplerate = SR_MHZ(devc->product->max_samplerate);
+		devc->limit_samples = devc->product->max_sample_depth * 1024;
+		devc->capture_ratio = ZLG_DEFAULT_CAPTURE_RATIO;
 
 		for (int j = 0; j < 16; j++)
 			sr_channel_new(sdi, j, SR_CHANNEL_LOGIC, TRUE, g_strdup_printf("CH%d", j));
@@ -113,8 +127,11 @@ static int config_get(uint32_t key, GVariant **data,
         *data = g_variant_new_uint64(devc->cur_samplerate);
         break;
     case SR_CONF_LIMIT_SAMPLES:
-        *data = g_variant_new_uint64(devc->limit_samples);
-        break;
+	    *data = g_variant_new_uint64(devc->limit_samples);
+		break;
+	case SR_CONF_CAPTURE_RATIO:
+	    *data = g_variant_new_uint64(devc->capture_ratio);
+		break;
     default:
         return SR_ERR_NA;
     }
@@ -145,9 +162,11 @@ static int config_set(uint32_t key, GVariant *data,
         break;
     case SR_CONF_LIMIT_SAMPLES:
         val = g_variant_get_uint64(data);
-        /* Emulate the limit by capping it at the maximum hardware buffer size */
-        devc->limit_samples = MIN(val, ZLG_LA1016_DEPTH);
+        devc->limit_samples = MIN(val, devc->product->max_sample_depth * 1024);
         break;
+	case SR_CONF_CAPTURE_RATIO:
+		devc->capture_ratio = g_variant_get_uint64(data);
+		break;
     default:
         return SR_ERR_NA;
     }
@@ -158,6 +177,7 @@ static int config_set(uint32_t key, GVariant *data,
 static int config_list(uint32_t key, GVariant **data, 
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
+	struct dev_context *devc;
     switch (key) {
     case SR_CONF_SCAN_OPTIONS:
     case SR_CONF_DEVICE_OPTIONS:
@@ -165,11 +185,15 @@ static int config_list(uint32_t key, GVariant **data,
             return SR_ERR_NA;
         return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
     case SR_CONF_SAMPLERATE:
+		if (!sdi)
+			return SR_ERR_ARG;
         *data = std_gvar_samplerates(ARRAY_AND_SIZE(samplerates));
         break;
     case SR_CONF_LIMIT_SAMPLES:
-        /* Return range of supported samples (from 1 to FIXED_SAMPLE_COUNT) */
-        *data = std_gvar_tuple_u64(1, ZLG_LA1016_DEPTH);
+		if (!sdi)
+			return SR_ERR_ARG;
+		devc = sdi->priv;
+        *data = std_gvar_tuple_u64(1, devc->product->max_sample_depth * 1024);
         break;
     case SR_CONF_TRIGGER_MATCH:
         *data = std_gvar_array_i32(ARRAY_AND_SIZE(trigger_matches));
@@ -202,7 +226,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 	 * We can send 0xFD02 and check the response.
 	 * For now, we upload every time for testing.
 	 */
-	ret = zlg_la_fw_upload(sdi, ZLG_FW_NAME);
+	ret = zlg_la_fw_upload(sdi, devc->product->fw_name);
 	if (ret != SR_OK)
 		return ret;
 

@@ -12,34 +12,47 @@
 
 #define LOG_PREFIX "zlg-la"
 
-#define ZLG_VID 0x04cc
-#define ZLG_PID 0x120e
-
-#define CMD_FW_UPLOAD  0x01 /* FE01: Firmware/FPGA bitstream start */
-#define CMD_GET_STATUS 0x02 /* FD02: Periodic status (every 3ms) */
-#define CMD_COMMIT     0x03 /* FC03: Settings commit/ping */
-#define CMD_SET_FREQ   0x05 /* FA05: Sample rate / divider */
-#define CMD_TELEMETRY  0x06 /* F906: Battery, power, and signal flags */
-#define CMD_SET_TRIG   0x07 /* F807: Trigger pattern/mask upload */
-#define CMD_QUERY_BUF  0x0c /* F30C: Activity check (Live LEDs) */
-#define CMD_START_CAP  0x0d /* F20D: Start logic acquisition */
+#define CMD_FW_UPLOAD       0x01 /* FE01: Firmware/FPGA bitstream start */
+#define CMD_GET_DEVICE_INFO 0x02 /* FD02: Get device info */
+#define CMD_COMMIT          0x03 /* FC03: Settings commit */
+#define CMD_SET_EXEC        0x05 /* FA05: Sample rate / divider, and Strat / Stop capture */
+#define CMD_GET_STATE       0x06 /* F906: Activity check (Trigger Armed) */
+#define CMD_SET_TRIG        0x07 /* F807: Trigger pattern/mask upload */
+#define CMD_GET_BULKIN      0x0c /* F30C: Activity check (Device Bulk Data, not used) */
+#define CMD_GET_SIZE        0x0d /* F20D: Get captured data size */
 
 #define STATE_IDLE    0x00
 #define STATE_CAPTURE 0x01
 #define STATE_WAITING 0x02
 #define STATE_DESTROY 0x03
 
-#define ZLG_FW_NAME "Configure1016.dll"
-#define ZLG_LA1016_DEPTH 32 * 1024 // fixed samples, 32K per channel, 16 channels 512K data
+#define ZLG_DEFAULT_CAPTURE_RATIO 10
+
+struct zlg_product {
+	uint16_t vid;
+	uint16_t pid;
+	const char *product_name;
+	const char *fw_name;
+	unsigned int channels;
+	unsigned int max_sample_depth;	/* In Ksamples/channel */
+	unsigned int max_samplerate; /* In MHz */
+};
+
+static const struct zlg_product zlg_products[] = {
+	{0x04cc, 0x120e, "la-1016", "Configure1016.dll", 16, 32,  100},
+	ALL_ZERO
+};
 
 struct dev_context {
-	struct sr_sw_limits limits;
-	uint64_t cur_samplerate;
+	struct zlg_product *product;
+	uint64_t limit_samples;  // default max samples
+	uint64_t capture_ratio;	 // default 10%
+	uint64_t cur_samplerate; // default max sample rate
 	uint16_t state;	// idle, capture, waiting ...
-	guint timer_id; // for the work loop
-	GMutex usb_mutex;
-	int limit_samples;
+	guint timer_id; // for the work loop TODO remove?
+	GMutex usb_mutex; // TODO remove?
 
+	// TODO remove, use sr_session_trigger_get()
 	uint16_t trigger_mask;    /* Which channels are involved in the trigger */
     uint16_t trigger_value;   /* High or Low level */
     uint16_t trigger_edge;    /* Rising or Falling */
