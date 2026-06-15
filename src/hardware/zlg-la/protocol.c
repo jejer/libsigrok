@@ -59,24 +59,25 @@ static int zlg_la_cmd(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8_t *pa
 }
 
 /* Replicates sub_100031C0: 100MHz Divider Logic */
-static int zlg_la_set_samplerate(const struct sr_dev_inst *sdi)
+static int zlg_la_set_samplerate_ratio(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	uint8_t payload[14] = {0};
 	uint32_t divider = 0;
 
-	/* Replicating pcap: 05 fa 02 83 04 09 ... divider at offset 10 */
+	uint32_t ratio = devc->product->max_sample_depth * 1024 * devc->capture_ratio / 100;
+
+	/* Replicating pcap: 05 fa 02 83 04 09 ... divider ratio */
 	payload[0] = 0x02;
 	payload[1] = 0x83;
 	payload[2] = 0x04;
 	payload[3] = 0x09;
-	payload[10] = 0xcc;	// trigger position, we use this default 10%
-	payload[11] = 0x0c;	// trigger position, we use this default 10%
-	if (devc->cur_samplerate != SR_MHZ(100)) {
+	WL32(&(payload[10]), ratio);
+	if (devc->cur_samplerate != SR_MHZ(devc->product->max_samplerate)) {
 		/* Formula: Divider = (100MHz / Rate) - 1 */
 		divider = (uint32_t)(100000000 / devc->cur_samplerate) - 1;
 		payload[5] = 0x1;	// enable divider
-		payload[6] = divider;
+		WL32(&(payload[6]), divider);
 	}
 
 	sr_info("Setting samplerate to %" PRIu64 " Hz (Divider: %u)", devc->cur_samplerate, divider);
@@ -157,7 +158,7 @@ static int zlg_la_start_capture(struct sr_dev_inst *sdi) {
 	}
 
 	// set freq
-	ret = zlg_la_set_samplerate(sdi);
+	ret = zlg_la_set_samplerate_ratio(sdi);
 	if (ret != SR_OK) {
 		return ret;
 	}
