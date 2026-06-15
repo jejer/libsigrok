@@ -33,9 +33,9 @@ struct zlg_product {
     uint16_t pid;
     const char *product_name;
     const char *fw_name;
-    unsigned int channels;
-    unsigned int max_sample_depth; /* In Ksamples/channel */
-    unsigned int max_samplerate;   /* In MHz */
+    uint32_t channels;
+    uint32_t max_sample_depth; /* In Ksamples/channel */
+    uint32_t max_samplerate;   /* In MHz */
 };
 
 static const struct zlg_product zlg_products[] = {

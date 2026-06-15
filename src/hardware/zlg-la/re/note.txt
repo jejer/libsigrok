@@ -238,3 +238,11 @@ Response:
 06f90210080c0000000000
 Response:
 ffffffffffffffffffffffff // without fw
+
+
+
+CC0C 0000 0300 0000 3473 0000
+CC0C 0000 7A45 0000 AB38 0000
+
+38AB: 14507 44% start point + 0ccc = trigger point
+457A: 17786 54% trigger point

@@ -16,7 +16,7 @@
         out_str[bytes_len * 2] = '\0';                               \
     } while (0)
 
-static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi, gboolean drain);
+static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi);
 
 static int zlg_la_cmd_write(const struct sr_dev_inst *sdi, uint8_t cmd_id, uint8_t *payload, size_t len) {
     struct sr_usb_dev_inst *usb = sdi->conn;
@@ -371,7 +371,7 @@ SR_PRIV int zlg_la_receive_data(int fd, int revents, void *cb_data) {
 
     if (!(status & 0x02) && (status & 0x08)) {
         // trigger armed
-        ret = zlg_la_receive_data_done(sdi, FALSE);
+        ret = zlg_la_receive_data_done(sdi);
         std_session_send_df_end(sdi);
         return FALSE;
     }
@@ -380,7 +380,7 @@ SR_PRIV int zlg_la_receive_data(int fd, int revents, void *cb_data) {
 }
 
 /* Process the raw 98312 bytes logic data */
-static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi, gboolean drain) {
+static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi) {
     struct dev_context *devc    = sdi->priv;
     struct sr_usb_dev_inst *usb = sdi->conn;
     struct sr_datafeed_packet packet;
@@ -390,10 +390,11 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi, gboolean drai
     uint8_t payload[16] = {0};
     uint8_t rsp[16]     = {0};
     int rsp_len         = 0;
-    uint8_t *in_buffer;
-    uint8_t *out_buffer;
-
-    int pin_data_len = 32 * 1024 * 16 / 8;
+    uint8_t *in_buffer  = NULL; /* Initialize to NULL to avoid freeing wild pointers */
+    uint8_t *out_buffer = NULL; /* Initialize to NULL */
+    uint32_t start_point;
+    uint32_t trigger_point;
+    gboolean is_trigger = FALSE;
 
     // stop capture 05fa 02800001
     payload[0] = 0x02;
@@ -415,83 +416,164 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi, gboolean drai
     if (ret != SR_OK) {
         return ret;
     }
+
     uint32_t data_len = RL32(&rsp[2]);
+    if (data_len == 0) {
+        return SR_ERR_BUG;
+    }
 
     sr_dbg("Receiving %u bytes of data...", data_len);
 
     in_buffer = g_malloc(data_len);
 
     /* Blocking read for now (TODO: Change to async later) */
-    // we must read all the data from device
-    ret = libusb_bulk_transfer(usb->devhdl, 0x82, in_buffer, data_len, &transferred, 2000);
-    if (ret < 0) {
-        sr_err("Receive failed: %s, transferred: %d", libusb_error_name(ret), transferred);
+    uint32_t total_transferred = 0;
+    while (total_transferred < data_len) {
+        ret = libusb_bulk_transfer(usb->devhdl, 0x82, in_buffer, data_len, &transferred, 2000);
+        if (ret < 0) {
+            sr_err("Receive failed: %s, transferred: %d", libusb_error_name(ret), transferred);
+            /* Go to exit sequence to safely clean up the allocated in_buffer */
+            ret = SR_ERR;
+            goto cleanup;
+        }
+        total_transferred += transferred;
     }
 
-    // cleanup
+    // get mode
     payload[0] = 0x02;
     payload[1] = 0x80;
     payload[2] = 0x00;
     payload[3] = 0x01;
     ret        = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
-    if (ret != SR_OK) {
-        return ret;
+    if (ret != SR_OK || rsp_len != 1) {
+        ret = SR_ERR;
+        goto cleanup;
     }
+    if (rsp[0] & 0x08) {
+        is_trigger = TRUE;
+    }
+
+    // get position
     payload[0] = 0x02;
     payload[1] = 0x88;
     payload[2] = 0x04;
     payload[3] = 0x0c;
     ret        = zlg_la_cmd(sdi, CMD_GET_STATE, payload, 4, rsp, &rsp_len);
-    if (ret != SR_OK) {
-        return ret;
+    if (ret != SR_OK || rsp_len != 12) {
+        ret = SR_ERR;
+        goto cleanup;
     }
+
+    // samples_before_trigger = RL32(rsp);
+    trigger_point = RL32(rsp + 4);
+    start_point   = RL32(rsp + 8);
+
+    // clean up device state
     ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
     if (ret != SR_OK) {
-        return ret;
+        ret = SR_ERR;
+        goto cleanup;
     }
 
     sr_dbg("Received %u bytes of data", transferred);
-    if (drain) {
-        g_free(in_buffer);
-        return SR_OK;
-    }
-    /*
-      la1016 data depth: 32k bits per channel, 16 channels.
-      32 * 1024 / 8 32k bytes per channel  x 16 channels = 65536 bytes (0xFFFF)
-      also, 2 bytes per sample x 32768 samples = 65536 bytes
 
-      usb raw data: 3 bytes per sample x 32768 samples = 98304 bytes + 8 extra bytes (3 samples) = 98312
-    */
-    // remote the extra byte
-    out_buffer              = g_malloc(pin_data_len);
-    uint32_t out_buffer_idx = 0;
-    for (uint32_t i = 0; i < 3 * devc->product->max_sample_depth * 1024; i++) {
-        if ((i + 1) % 3 == 0) {
-            continue;
+    uint32_t max_samples           = devc->product->max_sample_depth * 1024;
+    uint32_t scaled_before_samples = (devc->capture_ratio * devc->limit_samples) / 100;
+    uint32_t scaled_after_samples  = ((100 - devc->capture_ratio) * devc->limit_samples) / 100;
+    if (devc->limit_samples == max_samples) {
+        // workaround, hw write more data than reported, remove from head and tail
+        scaled_before_samples -= 8;
+        scaled_after_samples -= 8;
+    }
+    uint32_t scaled_start_point = trigger_point - scaled_before_samples;
+
+    if (scaled_before_samples > trigger_point) {
+        scaled_start_point = max_samples - (scaled_before_samples - trigger_point);
+    }
+    if (scaled_start_point < start_point) {
+    }
+
+    uint32_t scaled_end_point = trigger_point + scaled_after_samples;
+    if (scaled_end_point >= max_samples) {
+        scaled_end_point -= max_samples;
+    }
+
+    sr_dbg("trigger_point=0x%04x, samples=0x%04lx/0x%04x, start=0x%04x, end=0x%04x", trigger_point, devc->limit_samples,
+           max_samples, scaled_start_point, scaled_end_point);
+
+    /* Allocate output logic buffer securely */
+    size_t out_buffer_size = devc->limit_samples * 2; /* 16 channels = 2 bytes per sample */
+    out_buffer             = g_malloc(out_buffer_size);
+
+    uint32_t index              = 0;
+    uint32_t out_buffer_idx     = 0;
+    uint32_t pre_trigger_length = 0;
+    for (uint32_t i = 0; i < devc->limit_samples; i++) {
+        index = scaled_start_point + i;
+        if (index >= max_samples) {
+            index -= max_samples;
         }
-        out_buffer[out_buffer_idx] = in_buffer[i];
-        out_buffer_idx += 1;
-        if (out_buffer_idx > (devc->limit_samples * 2)) {
+        if (index == scaled_end_point) {
             break;
         }
+
+        /* Bounds protection: guarantee we do not read past USB transferred payload size */
+        if ((index * 3) + 1 >= (uint32_t)transferred) {
+            sr_err("Hardware ring buffer index parsing overflowed actual transferred USB length!");
+            ret = SR_ERR_DATA;
+            goto cleanup;
+        }
+
+        if (is_trigger && index == trigger_point && out_buffer_idx > 0) {
+            /* Send samples tracked before trigger point */
+            packet.type    = SR_DF_LOGIC;
+            packet.payload = &logic;
+            logic.length   = out_buffer_idx;
+            logic.unitsize = 2;
+            logic.data     = out_buffer;
+            sr_session_send(sdi, &packet);
+
+            /* Send trigger marker packet */
+            packet.type    = SR_DF_TRIGGER;
+            packet.payload = NULL;
+            sr_session_send(sdi, &packet);
+
+            pre_trigger_length = out_buffer_idx;
+        }
+
+        /* Bounds check protection for out_buffer writes */
+        if (out_buffer_idx >= out_buffer_size) {
+            sr_err("Output buffer write out of bounds structural error!");
+            ret = SR_ERR_BUG;
+            goto cleanup;
+        }
+
+        out_buffer[out_buffer_idx]     = in_buffer[index * 3];
+        out_buffer[out_buffer_idx + 1] = in_buffer[index * 3 + 1];
+        out_buffer_idx += 2;
     }
-    if (transferred > 0) {
+
+    /* Send remaining post-trigger samples payload */
+    uint32_t post_trigger_length = out_buffer_idx - pre_trigger_length;
+    if (post_trigger_length > 0) {
         packet.type    = SR_DF_LOGIC;
         packet.payload = &logic;
-        logic.length   = devc->limit_samples * 2;
-        logic.unitsize = 2; /* 16 channels */
-        logic.data     = out_buffer;
+        logic.length   = post_trigger_length;
+        logic.unitsize = 2;
+        logic.data     = out_buffer + pre_trigger_length;
         sr_session_send(sdi, &packet);
     }
 
+    ret = SR_OK;
+
+cleanup:
     g_free(in_buffer);
     g_free(out_buffer);
-
-    return SR_OK;
+    return ret;
 }
 
 SR_PRIV int zlg_la_hardware_stop(const struct sr_dev_inst *sdi) {
-    return zlg_la_receive_data_done(sdi, TRUE);
+    return zlg_la_receive_data_done(sdi);
 }
 
 SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name) {
