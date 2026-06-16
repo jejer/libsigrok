@@ -585,7 +585,7 @@ SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name) {
     int rsp_len;
     uint8_t buffer[512];
     int transferred, ret;
-    size_t size, offset;
+    size_t size, offset, read_bytes;
 
     // check device state
     ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
@@ -625,8 +625,8 @@ SR_PRIV int zlg_la_fw_upload(const struct sr_dev_inst *sdi, const char *name) {
     offset = 0;
     while (offset < size) {
         size_t chunk_size = MIN(size - offset, 512);
-        ret               = sr_resource_read(drvc->sr_ctx, &bitstream, buffer, chunk_size);
-        if (ret != SR_OK) {
+        read_bytes        = sr_resource_read(drvc->sr_ctx, &bitstream, buffer, chunk_size);
+        if (read_bytes != chunk_size) {
             sr_err("sr_resource_read failed %d", ret);
             break;
         }
