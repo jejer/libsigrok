@@ -392,7 +392,8 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi) {
     int rsp_len         = 0;
     uint8_t *in_buffer  = NULL; /* Initialize to NULL to avoid freeing wild pointers */
     uint8_t *out_buffer = NULL; /* Initialize to NULL */
-    uint32_t start_point;
+    // uint32_t samples_before_trigger;
+    // uint32_t start_point;
     uint32_t trigger_point;
     gboolean is_trigger = FALSE;
 
@@ -449,7 +450,7 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi) {
         ret = SR_ERR;
         goto cleanup;
     }
-    if (rsp[0] & 0x08) {
+    if (rsp[0] & 0x04) {
         is_trigger = TRUE;
     }
 
@@ -466,7 +467,7 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi) {
 
     // samples_before_trigger = RL32(rsp);
     trigger_point = RL32(rsp + 4);
-    start_point   = RL32(rsp + 8);
+    // start_point   = RL32(rsp + 8);
 
     // clean up device state
     ret = zlg_la_cmd(sdi, CMD_GET_DEVICE_INFO, NULL, 0, rsp, &rsp_len);
@@ -490,7 +491,9 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi) {
     if (scaled_before_samples > trigger_point) {
         scaled_start_point = max_samples - (scaled_before_samples - trigger_point);
     }
-    if (scaled_start_point < start_point) {
+    if (!is_trigger) {
+        // remove data before trigger point or non-trigger
+        scaled_start_point = trigger_point;
     }
 
     uint32_t scaled_end_point = trigger_point + scaled_after_samples;
@@ -513,6 +516,8 @@ static int zlg_la_receive_data_done(const struct sr_dev_inst *sdi) {
         if (index >= max_samples) {
             index -= max_samples;
         }
+
+        // Done
         if (index == scaled_end_point) {
             break;
         }
